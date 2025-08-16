@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+  <title>Parkour Quest</title>
+  <style>
+    :root{
+      --ui: rgba(255,255,255,.9);
+      --uiText: #111;
+      --accent: #4ade80; /* green platforms */
+      --lava: #ef4444;   /* lava red */
+      --lava2:#f97316;   /* orange accent */
+      --bg: #0f172a;     /* slate-900 */
+    }
+    html,body{margin:0;height:100%;background:var(--bg);color:white;font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;}
+    #game{position:fixed;inset:0;display:grid;place-items:center;overflow:hidden;}
+    canvas{width:100vw;height:100vh;display:block;touch-action:none;}
+
+    /* HUD */
+    .hud{position:fixed;left:12px;top:12px;background:var(--ui);color:var(--uiText);padding:8px 12px;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.25);font-weight:600;font-size:14px;user-select:none}
+    .hud .row{display:flex;gap:12px;align-items:center}
+    .hud .dot{width:8px;height:8px;border-radius:999px;background:var(--accent);display:inline-block}
+
+    /* Start / Win overlays */
+    .overlay{position:fixed;inset:0;display:grid;place-items:center;background:linear-gradient(180deg, rgba(15,23,42,.9), rgba(15,23,42,.75));backdrop-filter:blur(6px);}
+    .panel{background:white;color:#111;padding:28px 24px;border-radius:20px;box-shadow:0 12px 40px rgba(0,0,0,.35);max-width:680px;width:min(92vw,680px);}
+    .title{font-size:28px;font-weight:800;margin:0 0 12px}
+    .sub{opacity:.75;margin:0 0 16px}
+    .btn{appearance:none;border:0;background:#111;color:#fff;padding:12px 16px;border-radius:14px;font-weight:700;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.25)}
+    .btn:active{transform:translateY(1px)}
+
+    /* Mobile controls */
+    .controls{position:fixed;inset:0;pointer-events:none}
+    .pad{position:absolute;bottom:18px;left:18px;display:flex;gap:12px;pointer-events:auto}
+    .pad .cbtn{width:68px;height:68px;border-radius:999px;background:var(--ui);border:2px solid rgba(0,0,0,.1);display:grid;place-items:center;font-weight:900;color:#111;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+    .jump{position:absolute;bottom:18px;right:18px;pointer-events:auto}
+    .jump .cbtn{width:88px;height:88px;border-radius:999px;background:var(--ui);border:2px solid rgba(0,0,0,.1);display:grid;place-items:center;font-weight:900;color:#111;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+
+    @media (hover:hover) and (pointer:fine){
+      /* Fade controls a bit on desktop */
+      .controls{opacity:.35}
+    }
+  </style>
+</head>
+<body>
+  <div id="game">
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <div class="hud" id="hud" role="status" aria-live="polite">
+    <div class="row"><span class="dot"></span> <span id="levelLabel">Level 1/10</span></div>
+    <div class="row"><span class="dot" style="background:var(--lava)"></span> <span id="respawns">Respawns: 0</span></div>
+  </div>
+
+  <div class="overlay" id="startOverlay">
+    <div class="panel">
+      <h1 class="title">Parkour Quest</h1>
+      <p class="sub">10 levels of lava parkour. Green platforms. Hot lava below. Unlimited lives. Reach each <strong>door</strong> to advance. Touch <strong>flags</strong> to set checkpoints (they are on platforms). PC: <strong>←/→</strong> or <strong>A/D</strong> + <strong>Space</strong>. Mobile: on‑screen buttons.</p>
+      <button class="btn" id="startBtn">Start Game</button>
+    </div>
+  </div>
+
+  <div class="overlay" id="winOverlay" style="display:none">
+    <div class="panel">
+      <h2 class="title" id="winTitle">well done mommy</h2>
+      <p class="sub">You reached ATI. Respawns used: <span id="finalRespawns">0</span>.</p>
+      <button class="btn" id="againBtn">Play Again</button>
+    </div>
+  </div>
+
+  <div class="controls" aria-hidden="false">
+    <div class="pad">
+      <button class="cbtn" id="leftBtn" aria-label="Move Left">◀</button>
+      <button class="cbtn" id="rightBtn" aria-label="Move Right">▶</button>
+    </div>
+    <div class="jump">
+      <button class="cbtn" id="jumpBtn" aria-label="Jump">⟰</button>
+    </div>
+  </div>
+
+  <script>
+  // --- Utility ---------------------------------------------------------------
+  const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
+  const lerp=(a,b,t)=>a+(b-a)*t;
+
+  // --- Canvas setup ----------------------------------------------------------
+  const cvs = document.getElementById('canvas');
+  const ctx = cvs.getContext('2d');
+  let DPR = Math.max(1, Math.min(2, window.devicePixelRatio||1));
+  const VIEW = { w: 960, h: 540 }; // virtual view
+  function resize(){
+    const { innerWidth:W, innerHeight:H } = window;
+    cvs.width = Math.round(W * DPR);
+    cvs.height = Math.round(H * DPR);
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // --- Input (keyboard + on-screen) -----------------------------------------
+  const keys = { left:false, right:false, up:false };
+  const keymap = {
+    ArrowLeft:'left', ArrowRight:'right', ArrowUp:'up', ArrowDown:null,
+    a:'left', d:'right', w:'up', s:null, ' ':'up'
+  };
+  window.addEventListener('keydown',e=>{ const k=keymap[e.key]; if(k){ keys[k]=true; e.preventDefault(); }});
+  window.addEventListener('keyup',e=>{ const k=keymap[e.key]; if(k){ keys[k]=false; e.preventDefault(); }});
+
+  // On-screen buttons
+  function bindHold(btn, prop){
+    let hold=false; const set=v=>{keys[prop]=v};
+    const onDown=(e)=>{hold=true; set(true); e.preventDefault();};
+    const onUp=(e)=>{hold=false; set(false); e.preventDefault();};
+    btn.addEventListener('pointerdown', onDown);
+    btn.addEventListener('pointerup', onUp);
+    btn.addEventListener('pointercancel', onUp);
+    btn.addEventListener('pointerleave', onUp);
+  }
+  bindHold(document.getElementById('leftBtn'), 'left');
+  bindHold(document.getElementById('rightBtn'), 'right');
+  document.getElementById('jumpBtn').addEventListener('pointerdown', e=>{ e.preventDefault(); tryJump(); });
+
+  // --- Simple sound (WebAudio) ----------------------------------------------
+  let audioCtx=null; 
+  function ensureAudio(){ if(!audioCtx){ audioCtx = new (window.AudioContext||window.webkitAudioContext)(); } }
+  function beepJump(){ // springy jump blip
+    ensureAudio();
+    const now=audioCtx.currentTime;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type='sine';
+    o.frequency.setValueAtTime(320, now);
+    o.frequency.exponentialRampToValueAtTime(560, now+0.06);
+    o.frequency.exponentialRampToValueAtTime(220, now+0.20);
+    g.gain.setValueAtTime(0.35, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now+0.22);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(now); o.stop(now+0.25);
+  }
+  function ping(){
+    ensureAudio();
+    const now=audioCtx.currentTime;
+    const o=audioCtx.createOscillator(); const g=audioCtx.createGain();
+    o.type='triangle'; o.frequency.setValueAtTime(880, now);
+    g.gain.setValueAtTime(0.25, now); g.gain.exponentialRampToValueAtTime(0.001, now+0.2);
+    o.connect(g).connect(audioCtx.destination); o.start(now); o.stop(now+0.21);
+  }
+  function chime(){
+    ensureAudio();
+    const now=audioCtx.currentTime;
+    const o=audioCtx.createOscillator(); const g=audioCtx.createGain();
+    o.type='square'; o.frequency.setValueAtTime(660, now);
+    g.gain.setValueAtTime(0.2, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now+0.35);
+    o.connect(g).connect(audioCtx.destination); o.start(now); o.stop(now+0.36);
+  }
+
+  // --- World / Entities ------------------------------------------------------
+  const G = 2200; // gravity px/s^2
+  const SPEED = 420; // run speed
+  const JUMP = 820; // jump initial velocity
+  const COYOTE = 0.10; // seconds after leaving edge where jump still allowed
+
+  const PLAYER = { w:28, h:56 };
+  let state = {
+    levelIndex:0, levels:[],
+    player:{x:120,y:0, vx:0, vy:0, onGround:false, coyote:0, facing:1},
+    door:null, princess:null,
+    checkpoints:[], activeCP:null,
+    platforms:[], lavas:[], bounds:{w:2400,h:1200},
+    cam:{x:0,y:0}, time:0, wave:0,
+    started:false, won:false, respawns:0
+  };
+
+  // Level generator: builds 10 distinct layouts
+  function buildLevel(i){
+    const rng = mulberry32(0xC0FFEE ^ (i*997));
+    const platforms=[]; const lavas=[]; const checkpoints=[];
+    const H = 980; // floor baseline
+    let x=80; let y=760 - i*8; // gentle shift per level
+    for(let s=0;s<9;s++){
+      const w = 220 + Math.floor(rng()*140);
+      const plat = {x,y,w,h:20};
+      platforms.push(plat);
+      const gap = 160 + Math.floor(rng()*200);
+      // Lava between this and next platform
+      const lavaTop = y+20;
+      lavas.push({x:plat.x+plat.w, y:lavaTop, w:gap, h:Math.max(120, H - lavaTop)});
+      // next segment position with some vertical variation
+      x += w + gap;
+      y = clamp(y + Math.floor((rng()-0.5)*220), 320, 860);
+      // Drop occasional small islands
+      if(rng()<0.3){
+        const iw = 80 + Math.floor(rng()*90);
+        const iy = clamp(y - 120 - Math.floor(rng()*120), 220, 820);
+        platforms.push({x:x - Math.floor(gap*0.5), y:iy, w:iw, h:18});
+      }
+      // Checkpoints ON platforms (about 1/3 and 2/3 through the level)
+      if(s===2||s===5){
+        checkpoints.push({x: plat.x + plat.w/2, y: plat.y, r:16, active:false});
+      }
+    }
+    // Final platform for the door / princess
+    const lastW = 260 + Math.floor(rng()*160);
+    const lastY = clamp(y - 80, 280, 860);
+    const lastPlat = {x, y:lastY, w:lastW, h:22};
+    platforms.push(lastPlat);
+
+    // Bounds width based on last platform
+    const W = x + lastW + 600;
+
+    let door=null, princess=null;
+    if(i<9){
+      door = { w:46, h:90 };
+      door.x = x + lastW - door.w - 12;
+      door.y = lastY - door.h;
+    } else {
+      // Level 10: put princess on last platform
+      princess = {x: x + Math.floor(lastW*0.5), y:lastY-10, w:40, h:90, name:'ATI'};
+    }
+
+    return {
+      platforms,
+      lavas,
+      checkpoints,
+      door,
+      princess,
+      bounds:{w:W, h:1100}
+    }
+  }
+
+  // Simple seeded RNG for repeatable layouts
+  function mulberry32(a){ return function(){ var t = a += 0x6D2B79F5; t = Math.imul(t ^ t>>>15, t|1); t ^= t + Math.imul(t ^ t>>>7, t|61); return ((t ^ t>>>14)>>>0) / 4294967296; } }
+
+  function loadLevel(idx){
+    state.levelIndex = idx;
+    const L = buildLevel(idx);
+    state.platforms = L.platforms; state.lavas=L.lavas; state.checkpoints=L.checkpoints;
+    state.door = L.door; state.princess = L.princess; state.bounds=L.bounds;
+    // Spawn at first platform
+    const first = state.platforms[0];
+    state.player.x = first.x + 24; state.player.y = first.y - PLAYER.h;
+    state.player.vx = 0; state.player.vy = 0; state.player.coyote=0; state.player.onGround=false;
+    state.activeCP = {x:state.player.x, y:state.player.y};
+    updateLabels();
+  }
+
+  function updateLabels(){
+    document.getElementById('levelLabel').textContent = `Level ${state.levelIndex+1}/10`;
+    document.getElementById('respawns').textContent = `Respawns: ${state.respawns}`;
+  }
+
+  // --- Collision helpers -----------------------------------------------------
+  function rectsIntersect(a,b){ return !(a.x+a.w<=b.x || a.x>=b.x+b.w || a.y+a.h<=b.y || a.y>=b.y+b.h); }
+
+  function collidePlatforms(px,py,pw,ph, vx,vy){
+    let onGround=false; let nx=px, ny=py, nvx=vx, nvy=vy;
+    // Horizontal sweep
+    nx += vx;
+    for(const p of state.platforms){
+      if(rectsIntersect({x:nx,y:ny,w:pw,h:ph}, p)){
+        if(vx>0){ nx = p.x - pw; nvx=0; } else if(vx<0){ nx = p.x + p.w; nvx=0; }
+      }
+    }
+    // Vertical sweep
+    ny += vy;
+    for(const p of state.platforms){
+      if(rectsIntersect({x:nx,y:ny,w:pw,h:ph}, p)){
+        if(vy>0){ ny = p.y - ph; nvy=0; onGround=true; }
+        else if(vy<0){ ny = p.y + p.h; nvy=0; }
+      }
+    }
+    return {x:nx,y:ny,vx:nvx,vy:nvy,onGround};
+  }
+
+  function feetInLava(px,py,pw,ph){
+    const foot = {x:px+4, y:py+ph-2, w:pw-8, h:4};
+    for(const l of state.lavas){ if(rectsIntersect(foot,l)) return true; }
+    return false;
+  }
+
+  function touchDoor(px,py,pw,ph){
+    if(!state.door) return false; 
+    const d = {x:state.door.x, y:state.door.y, w:state.door.w, h:state.door.h};
+    const me = {x:px, y:py, w:pw, h:ph};
+    return rectsIntersect(me,d);
+  }
+
+  function touchPrincess(px,py,pw,ph){
+    if(!state.princess) return false;
+    const pr = {x:state.princess.x-20, y:state.princess.y-state.princess.h, w:40, h:state.princess.h};
+    const me = {x:px, y:py, w:pw, h:ph};
+    return rectsIntersect(me, pr);
+  }
+
+  function touchCheckpoint(px,py,pw,ph){
+    // checkpoints are placed ON platforms; trigger area sits just above platform top
+    for(const c of state.checkpoints){
+      const a = {x:c.x-16, y:c.y-40, w:32, h:42};
+      const me = {x:px, y:py, w:pw, h:ph};
+      if(rectsIntersect(me,a)) return c;
+    }
+    return null;
+  }
+
+  function respawn(){
+    state.respawns++; updateLabels();
+    const cp = state.activeCP || {x:120,y:0};
+    state.player.x = cp.x; state.player.y = cp.y; // spawn ON the platform at the saved spot
+    state.player.vx=0; state.player.vy=0; state.player.coyote=0; state.player.onGround=false;
+  }
+
+  // --- Game loop -------------------------------------------------------------
+  let last=performance.now();
+  function loop(now){
+    const dt = Math.min(0.033, (now-last)/1000); last=now; state.time+=dt; state.wave+=dt*1.2;
+    if(state.started && !state.won){
+      step(dt);
+    }
+    draw();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  function tryJump(){
+    if(!state.started||state.won) return;
+    if(state.player.onGround || state.player.coyote>0){
+      state.player.vy = -JUMP; state.player.onGround=false; state.player.coyote=0; beepJump();
+    }
+  }
+
+  function step(dt){
+    const p = state.player;
+    // Horizontal
+    const ax = (keys.right?1:0) - (keys.left?1:0);
+    p.vx = ax * SPEED * dt; // instantaneous, arcade-y
+    if(ax!==0) p.facing = ax>0?1:-1;
+
+    // Gravity
+    p.vy += G*dt;
+
+    // Coyote time countdown
+    if(p.onGround) p.coyote = COYOTE; else p.coyote = Math.max(0, p.coyote - dt);
+
+    // Collide
+    const res = collidePlatforms(p.x,p.y,PLAYER.w,PLAYER.h, p.vx, p.vy*dt);
+    p.x=res.x; p.y=res.y; p.vx=res.vx; p.vy = res.vy/dt; p.onGround=res.onGround;
+
+    // Jump key (keyboard hold)
+    if(keys.up){ tryJump(); keys.up=false; }
+
+    // Lava check
+    if(feetInLava(p.x,p.y,PLAYER.w,PLAYER.h)){
+      respawn();
+    }
+
+    // Checkpoints
+    const hit = touchCheckpoint(p.x,p.y,PLAYER.w,PLAYER.h);
+    if(hit && !hit.active){ hit.active=true; state.activeCP = {x:hit.x - PLAYER.w/2, y: hit.y - PLAYER.h}; ping(); }
+
+    // Door / Princess
+    if(touchDoor(p.x,p.y,PLAYER.w,PLAYER.h)){
+      chime();
+      if(state.levelIndex<9){ loadLevel(state.levelIndex+1); }
+    }
+    if(touchPrincess(p.x,p.y,PLAYER.w,PLAYER.h)){
+      state.won=true;
+      document.getElementById('finalRespawns').textContent = state.respawns;
+      document.getElementById('winOverlay').style.display='grid';
+    }
+
+    // Camera follow
+    const cx = clamp(p.x + PLAYER.w*0.5 - VIEW.w*0.5, 0, Math.max(0, state.bounds.w - VIEW.w));
+    const cy = clamp(p.y + PLAYER.h*0.5 - VIEW.h*0.5, 0, Math.max(0, state.bounds.h - VIEW.h));
+    state.cam.x = lerp(state.cam.x, cx, 0.12);
+    state.cam.y = lerp(state.cam.y, cy, 0.12);
+  }
+
+  // --- Draw -----------------------------------------------------------------
+  function draw(){
+    const W = cvs.width/DPR, H=cvs.height/DPR;
+    ctx.clearRect(0,0,W,H);
+
+    // Letterbox & world transform
+    const sx = W/VIEW.w, sy=H/VIEW.h, scale=Math.min(sx,sy);
+    const ox = (W- VIEW.w*scale)/2, oy=(H- VIEW.h*scale)/2;
+    ctx.save();
+    ctx.translate(ox,oy); ctx.scale(scale,scale);
+
+    // Parallax sky
+    drawBackground();
+
+    // Camera
+    ctx.save();
+    ctx.translate(-Math.floor(state.cam.x), -Math.floor(state.cam.y));
+
+    // Platforms (green)
+    for(const p of state.platforms){ drawPlatform(p); }
+
+    // Lava
+    for(const l of state.lavas){ drawLava(l, state.wave); }
+
+    // Checkpoints
+    for(const c of state.checkpoints){ drawCheckpoint(c); }
+
+    // Door / Princess
+    if(state.door) drawDoor(state.door);
+    if(state.princess) drawPrincess(state.princess);
+
+    // Player
+    drawPlayer(state.player);
+
+    ctx.restore(); // camera
+    ctx.restore(); // letterbox
+  }
+
+  function drawBackground(){
+    const g = ctx.createLinearGradient(0,0,0,VIEW.h);
+    g.addColorStop(0,'#0b1224'); g.addColorStop(1,'#111827');
+    ctx.fillStyle=g; ctx.fillRect(0,0,VIEW.w,VIEW.h);
+
+    // distant mountains
+    ctx.save();
+    ctx.globalAlpha=0.18; ctx.fillStyle='#6ee7b7';
+    const baseY = VIEW.h-80;
+    for(let i=0;i<8;i++){
+      const x = (i*220 + (state.time*10)%(VIEW.w+220)) - 220; // slow drift
+      ctx.beginPath(); ctx.moveTo(x, baseY);
+      ctx.lineTo(x+80, baseY-60); ctx.lineTo(x+160, baseY);
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawPlatform(p){
+    ctx.save();
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--accent');
+    ctx.strokeStyle='rgba(0,0,0,.25)'; ctx.lineWidth=2;
+    roundRect(ctx, p.x, p.y, p.w, p.h, 8); ctx.fill(); ctx.stroke();
+    // subtle grass blades
+    ctx.strokeStyle='rgba(0,0,0,.15)';
+    for(let i=0;i<p.w;i+=18){ ctx.beginPath(); ctx.moveTo(p.x+i+6,p.y); ctx.lineTo(p.x+i+6,p.y-6-2*Math.sin((i+state.time*60)*.05)); ctx.stroke(); }
+    ctx.restore();
+  }
+
+  function drawLava(l, t){
+    // Main body
+    const bodyGrad = ctx.createLinearGradient(0,l.y,0,l.y+l.h);
+    bodyGrad.addColorStop(0,'#ff8251'); bodyGrad.addColorStop(1,'#8b1a12');
+    ctx.fillStyle=bodyGrad;
+    ctx.fillRect(l.x, l.y, l.w, l.h);
+
+    // Wavy top
+    ctx.save(); ctx.beginPath();
+    const amp=6, freq=0.06;
+    ctx.moveTo(l.x, l.y);
+    for(let X=l.x; X<=l.x+l.w; X+=8){
+      const Y = l.y + Math.sin((X*freq)+t*4)*amp + 4*Math.sin((X*0.025)+t*2);
+      ctx.lineTo(X, Y);
+    }
+    ctx.lineTo(l.x+l.w, l.y-20); ctx.lineTo(l.x, l.y-20); ctx.closePath();
+    ctx.fillStyle='rgba(255,255,255,.35)'; ctx.fill();
+    ctx.restore();
+  }
+
+  function drawDoor(d){
+    ctx.save();
+    // base
+    ctx.fillStyle='#8b5e3c';
+    roundRect(ctx, d.x, d.y+10, d.w, d.h-10, 10); ctx.fill();
+    // arched top
+    ctx.beginPath();
+    ctx.moveTo(d.x, d.y+20); ctx.lineTo(d.x, d.y+20);
+    const midX = d.x + d.w/2;
+    ctx.moveTo(d.x, d.y+20);
+    ctx.arc(midX, d.y+20, d.w/2, Math.PI, 0);
+    ctx.lineTo(d.x+d.w, d.y+d.h-10); ctx.lineTo(d.x, d.y+d.h-10);
+    ctx.closePath(); ctx.fillStyle='#a37953'; ctx.fill();
+    // knob
+    ctx.beginPath(); ctx.arc(d.x+d.w-12, d.y+d.h/2, 4, 0, Math.PI*2); ctx.fillStyle='#2d1f13'; ctx.fill();
+    ctx.restore();
+  }
+
+  function drawPrincess(pr){
+    ctx.save();
+    const x = pr.x, y = pr.y; // y is feet on platform
+    // Dress
+    ctx.fillStyle='#f4c2f4';
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x-22, y-20); ctx.lineTo(x-30, y-70); ctx.lineTo(x+30, y-70); ctx.lineTo(x+22, y-20); ctx.closePath();
+    ctx.fill();
+    // Torso + head (stick)
+    ctx.strokeStyle='#111'; ctx.lineWidth=3;
+    // head
+    ctx.beginPath(); ctx.arc(x, y-88, 10, 0, Math.PI*2); ctx.stroke();
+    // body
+    ctx.beginPath(); ctx.moveTo(x, y-78); ctx.lineTo(x, y-60); ctx.stroke();
+    // crown
+    ctx.fillStyle='#ffd700'; ctx.beginPath(); ctx.moveTo(x-10,y-98); ctx.lineTo(x-3,y-110); ctx.lineTo(x+3,y-98); ctx.lineTo(x+10,y-110); ctx.lineTo(x+10,y-98); ctx.closePath(); ctx.fill();
+    // name above head
+    ctx.fillStyle='white'; ctx.font='bold 14px system-ui'; ctx.textAlign='center'; ctx.fillText(pr.name||'ATI', x, y-112);
+    ctx.restore();
+  }
+
+  function drawCheckpoint(c){
+    ctx.save();
+    // pole (sits on platform top at c.y)
+    ctx.strokeStyle='#222'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.lineTo(c.x, c.y-22); ctx.stroke();
+    // flag
+    ctx.fillStyle = c.active? '#22c55e' : '#94a3b8';
+    ctx.beginPath(); ctx.moveTo(c.x, c.y-22); ctx.lineTo(c.x+18, c.y-18); ctx.lineTo(c.x, c.y-14); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawPlayer(pl){
+    const x = pl.x + PLAYER.w/2, y = pl.y + PLAYER.h; // feet
+    ctx.save();
+    ctx.translate(x,y);
+    // walk animation
+    const t = state.time*10;
+    const swing = Math.sin(t* (pl.vx!==0? 1.6 : 0)) * (pl.vx!==0?10:0);
+    ctx.scale(pl.facing,1);
+
+    ctx.strokeStyle='white'; ctx.lineWidth=3; ctx.lineCap='round';
+    // body
+    ctx.beginPath(); ctx.moveTo(0,-54); ctx.lineTo(0,-18); ctx.stroke();
+    // head
+    ctx.beginPath(); ctx.arc(0, -64, 8, 0, Math.PI*2); ctx.stroke();
+    // arms
+    ctx.beginPath(); ctx.moveTo(0,-40); ctx.lineTo(14 + swing*0.2, -28); ctx.moveTo(0,-40); ctx.lineTo(-14 + swing*0.2, -28); ctx.stroke();
+    // legs
+    ctx.beginPath(); ctx.moveTo(0,-18); ctx.lineTo(12 + swing, 0); ctx.moveTo(0,-18); ctx.lineTo(-12 - swing, 0); ctx.stroke();
+    ctx.restore();
+  }
+
+  function roundRect(ctx,x,y,w,h,r){
+    const rr = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+rr,y);
+    ctx.arcTo(x+w,y,x+w,y+h,rr);
+    ctx.arcTo(x+w,y+h,x,y+h,rr);
+    ctx.arcTo(x,y+h,x,y,rr);
+    ctx.arcTo(x,y,x+w,y,rr);
+    ctx.closePath();
+  }
+
+  // --- Start/Restart ---------------------------------------------------------
+  document.getElementById('startBtn').addEventListener('click', ()=>{
+    ensureAudio();
+    document.getElementById('startOverlay').style.display='none';
+    state.started=true; state.won=false; state.respawns=0; updateLabels();
+    loadLevel(0);
+  });
+
+  document.getElementById('againBtn').addEventListener('click', ()=>{
+    document.getElementById('winOverlay').style.display='none';
+    state.started=true; state.won=false; state.respawns=0; updateLabels();
+    loadLevel(0);
+  });
+
+  // Preload first layout so the menu background has scenery
+  loadLevel(0);
+  </script>
+</body>
+</html>
+
